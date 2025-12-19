@@ -1,6 +1,6 @@
 # Open WebUI Episodic Memory Filter
 
-Give your Open WebUI assistants persistent, automatic memory of past conversations. This repository contains a single filter: `filters/episodic.py`.
+Give your Open WebUI assistants persistent, automatic memory of past conversations. This repository contains a single filter: `filter/episodic.py`.
 
 ## What This Is
 
@@ -41,7 +41,7 @@ An episodic memory layer that:
 3. Add the filter to Open WebUI:
    - Admin Panel -> Settings -> Filters
    - "+ Add Filter"
-   - Paste `episodic.py` into the editor
+   - Paste `filter/episodic.py` into the editor
    - Save and enable the filter
 
 ### Optional: Run Qdrant Server
