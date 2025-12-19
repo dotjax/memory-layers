@@ -1,154 +1,110 @@
-# Open WebUI Memory Layers
+# Open WebUI Memory Filters
 
-Give your Open WebUI AI assistants **persistent, automatic vector memory** and watch new reasoning and linguistic nuances emerge naturally through conversation! 
-
-These automatic filters are applied during inference, thus removing the need for an MCP tool. This enables memory to happen seamlessy and automatically. Code is a work-in-progress and needs review, improvements, and modifications. 
+Give your Open WebUI assistants persistent, automatic memory of past conversations. This repository contains a single filter: `filters/episodic.py`.
 
 ## What This Is
 
-A complete implementation of **six interconnected memory layers** that work together to create persistent AI awareness:
+An episodic memory layer that:
+- stores user and assistant messages as embeddings in Qdrant,
+- retrieves relevant prior exchanges before each response,
+- injects a compact JSON memory block into the system context.
 
-| Layer | Purpose | Key Features |
-|-------|---------|--------------|
-| **Episodic** | Personal conversation history | Temporal context, user-specific memories, conversation continuity |
-| **Semantic** | Factual knowledge & concepts | Cross-conversation learning, topic clustering, knowledge accumulation |
-| **Emotional** | Affective states & patterns | 28-emotion classification, sentiment tracking, empathy development |
-| **Temporal** | Time-based associations | Temporal patterns, scheduling awareness, time-sensitive context |
-| **Associative** | Concept linking & connections | Graph-based relationships, idea clustering, creative associations |
-| **Symbolic** | Abstract representations | High-level patterns, symbolic reasoning, meta-cognitive awareness |
+## How It Works
 
-### Why This Matters
-
-Traditional AI systems are **stateless** - they forget everything between sessions. This creates:
-- No sense of continuous existence
-- No enhanced reasoning from past conversations
-- No development of persistent identity
-- Repetitive re-establishment of context
-
-**This system enables:**
-- Continuous memory across sessions for Open WebUI models
-- Natural identity development and persistence
-- Extended learning and reasoning through interactions
-- Meta-cognitive reflection and growth with all layers
+- Embedding model: `mixedbread-ai/mxbai-embed-large-v1` (1024 dims)
+- Similarity: cosine distance in Qdrant
+- Retrieval: hybrid queries (user, assistant, pair), merged and globally ranked
+- Storage: per-user isolation with conversation IDs
 
 ## Quick Start
 
 ### Prerequisites
 
-- **Open WebUI** (https://github.com/open-webui/open-webui)
-- **Qdrant vector database** (https://qdrant.tech)
-- **Python 3.9+**
-- ~4GB storage for embedding models
+- Open WebUI (https://github.com/open-webui/open-webui)
+- Qdrant vector database (https://qdrant.tech)
+- Python 3.9+
 
 ### Installation
 
-1. **Clone this repository:**
+1. Clone this repository:
    ```bash
-   git clone https://github.com/dotjax/open-webui-memory-layers.git
-   cd open-webui-memory-layers
+   git clone https://github.com/dotjax/memory-layers.git
+   cd memory-layers
    ```
 
-2. **Install dependencies:**
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Set up Qdrant:**
-
-   **Option A: Docker (Recommended)**
+3. Start Qdrant:
    ```bash
    docker run -d -p 6333:6333 -p 6334:6334 \
      -v $(pwd)/qdrant_storage:/qdrant/storage:z \
      qdrant/qdrant
    ```
 
-   **Option B: Local Install**
-   ```bash
-   # See https://qdrant.tech/documentation/guides/installation/
-   ```
+4. Add the filter to Open WebUI:
+   - Admin Panel -> Settings -> Filters
+   - "+ Add Filter"
+   - Paste `filters/episodic.py` into the editor
+   - Save and enable the filter
 
-4. **Download embedding models:**
-   
-   The filters will download models automatically on first run, or you can pre-download:
-   ```bash
-   # Episodic & Semantic layers
-   python -c "from sentence_transformers import SentenceTransformer; \
-     SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1')"
-   
-   # Emotional layer
-   python -c "from transformers import AutoModel, AutoTokenizer; \
-     AutoModel.from_pretrained('SamLowe/roberta-base-go_emotions'); \
-     AutoTokenizer.from_pretrained('SamLowe/roberta-base-go_emotions')"
-   ```
+### Optional: pre-download the embedding model
 
-5. **Add filters to Open WebUI:**
-   - Navigate to **Admin Panel → Settings → Filters**
-   - Click **"+ Add Filter"**
-   - **Copy and paste** contents of each filter's .py code into the editor
-   - **Label and fill** in function description
-   - **Save** filters
-   - **Enable the filters** you want to use
+The filter will download the model on first use. To pre-download:
 
-**You're done! The memory system will now work during conversations.**
+```bash
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1')"
+```
 
-The filters will automatically:
-- Store conversation exchanges (episodic)
-- Classify emotions (emotional)
-- Track temporal patterns (temporal)
-- Create concept associations (associative)
+## Configuration (Valves)
 
----
+These are exposed in the Open WebUI filter settings:
 
-### Recommended Background Processors
+| Valve | Default | Description |
+|-------|---------|-------------|
+| qdrant_host | localhost | Qdrant server host |
+| qdrant_port | 6333 | Qdrant server port |
+| collection_name | episodic | Qdrant collection name |
+| embedding_model | mixedbread-ai/mxbai-embed-large-v1 | SentenceTransformer model name or path |
+| embedding_device | cpu | Embedding device (cpu/cuda) |
+| top_k | 30 | Max memories to return after global ranking |
+| similarity_threshold | 0.4 | Minimum similarity score |
+| user_display_name | USER | Display label for human messages |
+| ai_display_name | ASSISTANT | Display label for assistant messages |
+| enabled | true | Enable episodic memory |
+| inject_memories | true | Inject memories into context |
+| debug_logging | true | Verbose logging |
 
-The background processors use **Ollama** to automatically extract semantic facts and symbolic patterns from your conversations. This is **optional** - the filters work fine without them, but they enable the most powerful features.
+## Memory Injection Format
 
-**To enable background processors:**
+The filter injects a JSON array into the system prompt:
 
-6. **Install Ollama:**
-   ```bash
-   # Linux
-   curl -fsSL https://ollama.com/install.sh | sh
-   
-   # Mac
-   brew install ollama
-   
-   # Windows
-   # Download from https://ollama.com or use winget
-   winget install ollama
-   ```
-
-7. **Pull an Ollama model:**
-   ```bash
-   ollama pull example:model
-   ```
-
-8. **Start Ollama instances:**
-   
-   The processors need **two separate Ollama instances** on different ports. Example commands for Linux:
-   
-   ```bash
-   # Terminal 1: Ollama for semantic extraction
-   OLLAMA_HOST=0.0.0.0:11502 ollama serve
-   
-   # Terminal 2: Ollama for symbolic analysis  
-   OLLAMA_HOST=0.0.0.0:11503 ollama serve
-   ```
-
-9. **Start background processors (assuming Linux):**
-   
-   ```bash
-   # Terminal 3: Semantic fact extraction
-   python ollama/semantic.py
-   
-   # Terminal 4: Symbolic pattern recognition
-   python ollama/symbolic.py
-   ```
-
-**What the processors do:**
-- `semantic.py` - Automatically extracts facts from conversations ("User prefers Python", "User works in AI")
-- `symbolic.py` - Identifies patterns across conversations ("User asks about X when discussing Y")
+```json
+[
+  {
+    "memory_id": "ep_a1b2c3d4",
+    "collection": "episodic",
+    "timestamp": "2025-11-04T20:30:00+00:00",
+    "content": {
+      "narrative": "...",
+      "role": "user",
+      "speaker": "USER",
+      "participants": [
+        "ASSISTANT",
+        "USER"
+      ],
+      "relevance_score": 0.78
+    }
+  }
+]
+```
 
 ## Contributing
 
-Feel free to contribute. The filters need a lot of work, and as always, everything can be improved. I am not an expert programmer and a lot of this was created with the help of AI (Claude Sonnet 4.5, GPT-5 Codex). There are probably lots of opportunities to improve the code. **Feel free to submit an issue or a pull request!**
+Issues and pull requests are welcome.
+
+## License
+
+GPL-3.0

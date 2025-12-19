@@ -1,90 +1,86 @@
 """
 Episodic Memory Filter for Open WebUI
 
-This filter implements episodic memory - the storage and retrieval of specific 
-conversational exchanges with temporal context. It enables AI systems to:
+This filter stores per-user conversation snippets in Qdrant and retrieves
+relevant memories before each assistant response.
 
-- Remember previous conversations with users
-- Maintain conversation continuity across sessions
-- Provide contextual responses based on past interactions
-- Develop user-specific understanding over time
+Flow:
+    1. Inlet: capture the latest user message, retrieve similar memories,
+       and inject them into the system context.
+    2. Outlet: store the assistant response and an optional user+assistant pair.
 
-Architecture:
-    Uses Qdrant vector database to store conversation memories as embeddings.
-    Each memory includes:
-    - Message content and role (user/assistant)
-    - Timestamp with timezone awareness
-    - User identification for isolation
-    - Conversation threading
-
-Usage:
-    This filter works automatically when installed in Open WebUI:
-    1. Inlet: Retrieves relevant past memories before AI response
-    2. Outlet: Stores new exchange after AI response
-    
-    Configuration via Valves in Open WebUI admin panel.
-
-Memory Format:
-    {
-        "memory_id": "ep_a1b2c3d4",
-        "collection": "episodic",
-        "timestamp": "2025-11-04T20:30:00Z",
-        "content": {
-            "role": "user",
-            "message": "...",
-            "response": "..."
+Memory Injection Format:
+    [
+        {
+            "memory_id": "ep_a1b2c3d4",
+            "collection": "episodic",
+            "timestamp": "2025-11-04T20:30:00+00:00",
+            "content": {
+                "narrative": "...",
+                "role": "user",
+                "speaker": "USER",
+                "participants": ["ASSISTANT", "USER"],
+                "relevance_score": 0.78
+            }
         }
-    }
+    ]
 
 Technical Details:
     - Embedding Model: mixedbread-ai/mxbai-embed-large-v1 (1024 dims)
-    - Similarity: Cosine distance
+    - Similarity: cosine distance
     - Storage: Qdrant vector database
-    - Lazy Loading: Models load on first use
+    - Lazy Loading: models load on first use
 
 Author: dotjax
 License: GPL-3.0
-Repository: https://github.com/dotjax/open-webui-memory-layers
+Repository: https://github.com/dotjax/memory-layers
 """
 
 from __future__ import annotations
 
+import json
 import time
 import traceback
 import uuid
+from collections import OrderedDict
+from collections.abc import Callable, MutableSequence, Sequence
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Callable, Dict, MutableSequence, Optional, Sequence, TypeVar
+from datetime import datetime, timezone
+from typing import Any, Optional, TypeVar
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter as QdrantFilter,
     MatchValue,
+    PayloadSchemaType,
     PointStruct,
+    SearchRequest,
     VectorParams,
 )
 from sentence_transformers import SentenceTransformer
-from zoneinfo import ZoneInfo
 
-MODEL_VECTOR_SIZE = 1024
 ASSISTANT_ID = "assistant"  # Generic assistant identifier
 USER_METADATA_KEY = "_episodic_user_id"
 USER_MESSAGE_KEY = "_episodic_user_message"
 USER_CONVERSATION_KEY = "_episodic_user_conversation_id"
 LAST_MESSAGE_ID_KEY = "_episodic_last_message_id"
-LAST_MESSAGE_ROLE_KEY = "_episodic_last_role"
-MEMORY_SECTION_HEADER = "## Relevant Memories"
-MEMORY_SECTION_FOOTER = "---"
-DEFAULT_MODEL_PATH = "/home/ubuntu/dev/models/embedding/mxbai-embed-large-v1"
-LOCAL_TIMEZONE = ZoneInfo("America/Chicago")
+DEFAULT_EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
 
-_MODEL_CACHE: Dict[str, SentenceTransformer] = {}
-_QDRANT_CACHE: Dict[str, QdrantClient] = {}
 
-MessageList = MutableSequence[Dict[str, str]]
+@dataclass
+class _CacheEntry:
+    value: Any
+    last_used_monotonic: float
+
+
+_MODEL_CACHE: "OrderedDict[str, _CacheEntry]" = OrderedDict()
+_QDRANT_CACHE: "OrderedDict[str, _CacheEntry]" = OrderedDict()
+
+MessageList = MutableSequence[dict[str, str]]
 T = TypeVar("T")
 
 
@@ -97,41 +93,37 @@ def _generate_memory_id(collection: str, existing_id: Optional[str] = None) -> s
 
 def _format_memories_json(memories: list[dict[str, Any]]) -> str:
     """Format multiple memories as JSON array string."""
-    import json
-    from datetime import timezone
     if not memories:
         return "[]"
-    
+
     memory_objects = []
     for memory in memories:
         memory_id = _generate_memory_id(
-            memory["collection"], 
-            memory.get("existing_id")
+            memory["collection"],
+            memory.get("existing_id"),
         )
-        
+
         memory_obj = {
             "memory_id": memory_id,
             "collection": memory["collection"],
             "timestamp": memory.get("timestamp", datetime.now(timezone.utc).isoformat()),
-            "content": memory["content"]
+            "content": memory["content"],
         }
         memory_objects.append(memory_obj)
-    
+
     return json.dumps(memory_objects, indent=2)
 
 
 def append_system_context(messages: MessageList, context: str) -> None:
     if not context:
         return
-    if not messages:
+    if not messages or messages[0].get("role") != "system":
         messages.insert(0, {"role": "system", "content": context})
         return
     first_message = messages[0]
-    if first_message.get("role") == "system":
-        existing = first_message.get("content", "")
-        first_message["content"] = f"{existing}{context}"
-    else:
-        messages.insert(0, {"role": "system", "content": context})
+    existing = first_message.get("content", "")
+    separator = "\n" if existing and not existing.endswith("\n") else ""
+    first_message["content"] = f"{existing}{separator}{context}"
 
 
 def run_qdrant_operation(
@@ -146,13 +138,78 @@ def run_qdrant_operation(
     for attempt in range(retries + 1):
         try:
             return operation()
-        except Exception as exc:                
+        except Exception as exc:
             last_error = exc
             log(f"{description} failed (attempt {attempt + 1}/{retries + 1}): {exc}", "ERROR")
             if attempt == retries:
                 break
             time.sleep(backoff_seconds)
     raise RuntimeError(f"{description} failed after {retries + 1} attempts") from last_error
+
+
+def _prune_lru_cache(
+    cache: "OrderedDict[str, _CacheEntry]",
+    *,
+    max_items: int,
+    ttl_seconds: int,
+    on_evict: Optional[Callable[[Any], None]] = None,
+) -> None:
+    if not cache:
+        return
+    now = time.monotonic()
+
+    if ttl_seconds > 0:
+        expired_keys = [
+            key
+            for key, entry in cache.items()
+            if now - entry.last_used_monotonic > ttl_seconds
+        ]
+        for key in expired_keys:
+            entry = cache.pop(key, None)
+            if entry is not None and on_evict is not None:
+                try:
+                    on_evict(entry.value)
+                except Exception:
+                    pass
+
+    if max_items <= 0:
+        return
+    while len(cache) > max_items:
+        _, entry = cache.popitem(last=False)
+        if on_evict is not None:
+            try:
+                on_evict(entry.value)
+            except Exception:
+                pass
+
+
+def _cache_get(
+    cache: "OrderedDict[str, _CacheEntry]",
+    key: str,
+    *,
+    ttl_seconds: int,
+) -> Optional[Any]:
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    entry.last_used_monotonic = time.monotonic()
+    cache.move_to_end(key)
+    return entry.value
+
+
+def _to_float_vector(vector: Any) -> list[float]:
+    if hasattr(vector, "tolist"):
+        vector = vector.tolist()
+    return [float(value) for value in vector]
+
+
+def _cache_put(
+    cache: "OrderedDict[str, _CacheEntry]",
+    key: str,
+    value: Any,
+) -> None:
+    cache[key] = _CacheEntry(value=value, last_used_monotonic=time.monotonic())
+    cache.move_to_end(key)
 
 
 @dataclass(frozen=True)
@@ -164,32 +221,52 @@ class RetrievalQuery:
 
 class Filter:
     class Valves(BaseModel):
-        qdrant_host: str = Field(default="localhost", description="Qdrant server host")
-        qdrant_port: int = Field(default=6333, description="Qdrant server port")
-        collection_name: str = Field(default="episodic", description="Qdrant server port")
+        qdrant_host: str = Field(default="localhost", description="Qdrant server host (if server is running)")
+        qdrant_port: int = Field(default=6333, description="Qdrant server port (if server is running)")
+        storage_path: str = Field(default="./qdrant_storage", description="Local storage path for embedded mode")
+        collection_name: str = Field(default="episodic", description="Qdrant collection name")
         embedding_model: str = Field(
-            default=DEFAULT_MODEL_PATH,
-            description="SentenceTransformer model path or name",
+            default=DEFAULT_EMBEDDING_MODEL,
+            description="SentenceTransformer model name or path",
         )
         embedding_device: str = Field(default="cpu", description="Embedding device (cpu/cuda)")
-        top_k: int = Field(default=30, description="Total memories to retrieve across strategies")
+        top_k: int = Field(
+            default=30,
+            ge=0,
+            description="Total memories to retrieve across strategies",
+        )
+        retrieval_overfetch_factor: float = Field(
+            default=1.2,
+            ge=1.0,
+            le=3.0,
+            description="Multiplier for per-strategy retrieval limits to offset dedupe/threshold filtering",
+        )
         similarity_threshold: float = Field(
             default=0.4,
             ge=0.0,
             le=1.0,
             description="Minimum similarity score for a memory to be considered relevant",
         )
+        max_cached_models: int = Field(
+            default=2,
+            ge=0,
+            description="Maximum cached embedding models (0 = unlimited)",
+        )
+        max_cached_qdrant_clients: int = Field(
+            default=4,
+            ge=0,
+            description="Maximum cached Qdrant clients (0 = unlimited)",
+        )
+        cache_ttl_seconds: int = Field(
+            default=0,
+            ge=0,
+            description="Cache TTL in seconds for models/clients (0 = no TTL)",
+        )
         user_display_name: str = Field(default="USER", description="Display label for human messages")
         ai_display_name: str = Field(default="ASSISTANT", description="Display label for assistant messages")
         enabled: bool = Field(default=True, description="Enable episodic memory system")
         inject_memories: bool = Field(default=True, description="Inject relevant memories into context")
         debug_logging: bool = Field(default=True, description="Emit verbose debug logs")
-
-        @validator("top_k")
-        def _validate_top_k(cls, value: int) -> int:  # noqa: N805
-            if value < 0:
-                raise ValueError("top_k must be non-negative")
-            return value
 
     def __init__(self) -> None:
         self.valves = self.Valves()
@@ -207,45 +284,66 @@ class Filter:
 
     @property
     def qdrant(self) -> QdrantClient:
-        cache_key = f"{self.valves.qdrant_host}:{self.valves.qdrant_port}"
-        if cache_key not in _QDRANT_CACHE:
+        cache_key = f"{self.valves.qdrant_host}:{self.valves.qdrant_port}:{self.valves.storage_path}"
+        cached = _cache_get(_QDRANT_CACHE, cache_key, ttl_seconds=self.valves.cache_ttl_seconds)
+        if cached is None:
+            client = None
             try:
-                self._log(f"Connecting to Qdrant at {self.valves.qdrant_host}:{self.valves.qdrant_port} (FIRST CONNECTION - caching in memory)", "INFO")
-                _QDRANT_CACHE[cache_key] = QdrantClient(
+                self._log(
+                    f"Attempting to connect to Qdrant server at {self.valves.qdrant_host}:{self.valves.qdrant_port}",
+                    "INFO",
+                )
+                client = QdrantClient(
                     host=self.valves.qdrant_host,
                     port=self.valves.qdrant_port,
-                    timeout=5.0,
+                    timeout=2.0,
                 )
                 run_qdrant_operation(
-                    _QDRANT_CACHE[cache_key].get_collections,
+                    client.get_collections,
                     self._log,
                     description="qdrant.get_collections",
+                    retries=0,
                 )
-                self._log("Qdrant client cached in memory permanently", "DEBUG")
-            except Exception as exc:
-                self._log(f"Failed to connect to Qdrant: {exc}", "ERROR")
-                raise
-        else:
-            self._log("Using cached Qdrant client", "DEBUG")
-        return _QDRANT_CACHE[cache_key]
+                self._log(f"Connected to Qdrant server (dashboard available at http://{self.valves.qdrant_host}:{self.valves.qdrant_port}/dashboard)", "INFO")
+            except Exception:
+                self._log(f"Qdrant server not available, using embedded mode at {self.valves.storage_path}", "INFO")
+                client = QdrantClient(path=self.valves.storage_path)
+            _cache_put(_QDRANT_CACHE, cache_key, client)
+            _prune_lru_cache(
+                _QDRANT_CACHE,
+                max_items=self.valves.max_cached_qdrant_clients,
+                ttl_seconds=self.valves.cache_ttl_seconds,
+                on_evict=lambda c: getattr(c, "close", lambda: None)(),
+            )
+            return client
+        return cached
 
     @property
     def embedding_model(self) -> SentenceTransformer:
         cache_key = f"{self.valves.embedding_model}_{self.valves.embedding_device}"
-        if cache_key not in _MODEL_CACHE:
+        cached = _cache_get(_MODEL_CACHE, cache_key, ttl_seconds=self.valves.cache_ttl_seconds)
+        if cached is None:
             try:
                 self._log(f"Loading embedding model: {self.valves.embedding_model} (FIRST LOAD - caching in memory)", "INFO")
-                _MODEL_CACHE[cache_key] = SentenceTransformer(
+                model = SentenceTransformer(
                     self.valves.embedding_model,
                     device=self.valves.embedding_device,
                 )
-                self._log("Embedding model cached in memory permanently", "DEBUG")
+                _cache_put(_MODEL_CACHE, cache_key, model)
+                _prune_lru_cache(
+                    _MODEL_CACHE,
+                    max_items=self.valves.max_cached_models,
+                    ttl_seconds=self.valves.cache_ttl_seconds,
+                )
+                return model
             except Exception as exc:
                 self._log(f"Failed to load embedding model: {exc}", "ERROR")
                 raise
-        else:
-            self._log("Using cached embedding model", "DEBUG")
-        return _MODEL_CACHE[cache_key]
+        return cached
+
+    @property
+    def vector_size(self) -> int:
+        return self.embedding_model.get_sentence_embedding_dimension()
 
     def _ensure_collection(self) -> None:
         if self._collection_initialized:
@@ -258,29 +356,66 @@ class Filter:
         ).collections
         exists = any(col.name == collection_name for col in collections)
         if not exists:
-            self._log(f"Creating collection '{collection_name}' with vector size {MODEL_VECTOR_SIZE}", "INFO")
+            vector_size = self.vector_size
+            self._log(f"Creating collection '{collection_name}' with vector size {vector_size}", "INFO")
             run_qdrant_operation(
                 lambda: self.qdrant.create_collection(
                     collection_name=collection_name,
-                    vectors_config=VectorParams(size=MODEL_VECTOR_SIZE, distance=Distance.COSINE),
+                    vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
                 ),
                 self._log,
                 description=f"qdrant.create_collection[{collection_name}]",
             )
-            self._log(f"Collection '{collection_name}' created", "DEBUG")
         else:
             info = run_qdrant_operation(
                 lambda: self.qdrant.get_collection(collection_name=collection_name),
                 self._log,
                 description=f"qdrant.get_collection[{collection_name}]",
             )
-            vector_size = self._extract_vector_size(info.config.params.vectors)  # type: ignore[attr-defined]
-            if vector_size and vector_size != MODEL_VECTOR_SIZE:
-                raise ValueError(
-                    f"Collection '{collection_name}' vector size {vector_size} does not match required size {MODEL_VECTOR_SIZE}",
-                )
-            self._log(f"Collection '{collection_name}' already exists", "DEBUG")
+            existing_size = self._extract_vector_size(info.config.params.vectors)  # type: ignore[attr-defined]
+            if existing_size:
+                expected_size = self.vector_size
+                if existing_size != expected_size:
+                    raise ValueError(
+                        f"Collection '{collection_name}' vector size {existing_size} does not match model dimension {expected_size}",
+                    )
+
         self._collection_initialized = True
+
+    def _ensure_payload_indexes(self, collection_name: str) -> None:
+        """Create payload indexes for filtered fields to keep searches fast as the collection grows."""
+
+        def ensure_index(field_name: str, schema: PayloadSchemaType) -> None:
+            try:
+                run_qdrant_operation(
+                    lambda: self.qdrant.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=schema,
+                    ),
+                    self._log,
+                    description=f"qdrant.create_payload_index[{field_name}]",
+                )
+            except UnexpectedResponse as exc:
+                if getattr(exc, "status_code", None) == 409:
+                    self._log(f"Payload index '{field_name}' already exists", "DEBUG")
+                    return
+                self._log_exception(f"Failed creating payload index '{field_name}'", exc)
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc).lower()
+                if "already exists" in message or "conflict" in message:
+                    self._log(f"Payload index '{field_name}' already exists", "DEBUG")
+                    return
+                self._log_exception(f"Failed creating payload index '{field_name}'", exc)
+
+        fields: dict[str, PayloadSchemaType] = {
+            "user_id": PayloadSchemaType.KEYWORD,
+            "role": PayloadSchemaType.KEYWORD,
+            "message_type": PayloadSchemaType.KEYWORD,
+            "conversation_id": PayloadSchemaType.UUID,
+        }
+        for field_name, schema in fields.items():
+            ensure_index(field_name, schema)
 
     @staticmethod
     def _extract_vector_size(vectors_config: Any) -> Optional[int]:
@@ -295,7 +430,7 @@ class Filter:
             return None
         return None
 
-    def inlet(self, body: Dict[str, Any], __user__: Dict[str, Any]) -> Dict[str, Any]:
+    def inlet(self, body: dict[str, Any], __user__: dict[str, Any]) -> dict[str, Any]:
         if not self.valves.enabled:
             self._log("Episodic memory disabled via configuration", "DEBUG")
             return body
@@ -315,20 +450,24 @@ class Filter:
             metadata.setdefault(USER_METADATA_KEY, user_id)
             message_conversation_id = str(uuid.uuid4())
             metadata[LAST_MESSAGE_ID_KEY] = message_conversation_id
-            metadata[LAST_MESSAGE_ROLE_KEY] = role
-            if role == "user":
-                metadata[USER_CONVERSATION_KEY] = message_conversation_id
-                metadata[USER_MESSAGE_KEY] = message_content
+            if role != "user":
+                self._log(
+                    f"Latest message role '{role}' not stored in episodic memory; skipping inlet storage",
+                    "DEBUG",
+                )
+                return body
+            metadata[USER_CONVERSATION_KEY] = message_conversation_id
+            metadata[USER_MESSAGE_KEY] = message_content
             previous_assistant_message = self._find_latest_assistant_message(messages[:-1])
             self._log(
                 (
-                    "Inlet captured message "
-                    f"role='{role}' conversation_id='{message_conversation_id}' for user_id='{metadata.get(USER_METADATA_KEY)}'"
+                    "Inlet captured user message "
+                    f"conversation_id='{message_conversation_id}' for user_id='{metadata.get(USER_METADATA_KEY)}'"
                 ),
                 "DEBUG",
             )
             self._ensure_collection()
-            if self.valves.inject_memories and role == "user":
+            if self.valves.inject_memories:
                 if previous_assistant_message:
                     memories = self._retrieve_memories(
                         message_content,
@@ -342,14 +481,10 @@ class Filter:
                     append_system_context(messages, self._format_memories(memories))
                     self._log(f"Injected {len(memories)} episodic memories into context", "DEBUG")
             else:
-                self._log(
-                    "Skipping hybrid retrieval "
-                    f"(inject_memories={self.valves.inject_memories}, role='{role}')",
-                    "DEBUG",
-                )
+                self._log("Skipping memory injection (inject_memories=False)", "DEBUG")
             self._store_memory(
                 content=message_content,
-                role=role,
+                role="user",
                 conversation_id=message_conversation_id,
                 user_id=metadata.get(USER_METADATA_KEY, "unknown"),
                 message_type="individual",
@@ -359,7 +494,7 @@ class Filter:
             self._log_exception("Error during inlet processing", exc)
         return body
 
-    def outlet(self, body: Dict[str, Any], __user__: Dict[str, Any]) -> Dict[str, Any]:
+    def outlet(self, body: dict[str, Any], __user__: dict[str, Any]) -> dict[str, Any]:
         if not self.valves.enabled:
             return body
         try:
@@ -376,8 +511,10 @@ class Filter:
                 self._log("Assistant message is empty; skipping outlet processing", "DEBUG")
                 return body
             metadata = body.get("metadata") or {}
-            user_id = metadata.get(USER_METADATA_KEY, "unknown")
-            user_conversation_id = metadata.get(LAST_MESSAGE_ID_KEY)
+            user_id = metadata.get(USER_METADATA_KEY) or (__user__ or {}).get("id", "unknown")
+            user_conversation_id = metadata.get(USER_CONVERSATION_KEY) or metadata.get(
+                LAST_MESSAGE_ID_KEY
+            )
             user_message_content = metadata.get(USER_MESSAGE_KEY, "")
             self._ensure_collection()
             ai_conversation_id = str(uuid.uuid4())
@@ -390,7 +527,10 @@ class Filter:
                 linked_ids=None,
             )
             if user_conversation_id and user_message_content:
-                pair_content = f"User: {user_message_content}\nMe: {assistant_message}"
+                pair_content = (
+                    f"{self.valves.user_display_name}: {user_message_content}\n"
+                    f"{self.valves.ai_display_name}: {assistant_message}"
+                )
                 pair_conversation_id = str(uuid.uuid4())
                 self._store_memory(
                     content=pair_content,
@@ -417,10 +557,10 @@ class Filter:
         if not content.strip():
             self._log("Skipped storing blank content", "DEBUG")
             return
-        embedding = self.embedding_model.encode(content)
+        vector = _to_float_vector(self.embedding_model.encode(content))
         point_id = str(uuid.uuid4())
-        timestamp = datetime.now(LOCAL_TIMEZONE).isoformat()
-        payload: Dict[str, Any] = {
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload: dict[str, Any] = {
             "content": content,
             "role": role,
             "timestamp": timestamp,
@@ -431,7 +571,7 @@ class Filter:
         }
         if linked_ids:
             payload["linked_ids"] = list(linked_ids)
-        point = PointStruct(id=point_id, vector=embedding, payload=payload)
+        point = PointStruct(id=point_id, vector=vector, payload=payload)
         run_qdrant_operation(
             lambda: self.qdrant.upsert(
                 collection_name=self.valves.collection_name,
@@ -442,10 +582,28 @@ class Filter:
         )
         self._log(f"Persisted episodic memory point_id={point_id}", "DEBUG")
 
-    def _retrieve_memories(self, user_message: str, ai_message: str, user_id: str) -> list[Dict[str, Any]]:
+    def _retrieve_memories(self, user_message: str, ai_message: str, user_id: str) -> list[dict[str, Any]]:
         if self.valves.top_k <= 0:
             self._log("top_k <= 0; retrieval skipped", "DEBUG")
             return []
+
+        k_total = self.valves.top_k
+        if k_total == 1:
+            budgets = {"pair": 1, "assistant": 0, "user": 0}
+        elif k_total == 2:
+            budgets = {"pair": 1, "assistant": 0, "user": 1}
+        else:
+            remaining = k_total - 3
+            add_pair = int(remaining * 0.5 + 0.5)
+            add_assistant = int(remaining * 0.25 + 0.5)
+            add_user = remaining - add_pair - add_assistant
+            budgets = {
+                "pair": 1 + add_pair,
+                "assistant": 1 + add_assistant,
+                "user": 1 + add_user,
+            }
+
+        overfetch = self.valves.retrieval_overfetch_factor
         queries = [
             RetrievalQuery(
                 label="pair",
@@ -480,26 +638,41 @@ class Filter:
                 ),
             ),
         ]
-        limits = self._distribute_limits(self.valves.top_k, len(queries))
-        memories: list[Dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for limit, query in zip(limits, queries):
-            if limit <= 0:
-                self._log(f"Skipping '{query.label}' retrieval due to zero limit", "DEBUG")
-                continue
-            embedding = self.embedding_model.encode(query.text)
-            search_results = run_qdrant_operation(
-                lambda: self.qdrant.search(
-                    collection_name=self.valves.collection_name,
-                    query_vector=embedding,
-                    query_filter=query.query_filter,
+        active_queries = [(q, budgets.get(q.label, 0)) for q in queries if budgets.get(q.label, 0) > 0]
+        if not active_queries:
+            return []
+        embeddings = self.embedding_model.encode([q.text for q, _ in active_queries])
+        vector_size = self.vector_size
+        search_requests = []
+        for (query, budget), embedding in zip(active_queries, embeddings):
+            limit = max(1, int(budget * overfetch))
+            vector = _to_float_vector(embedding)
+            if len(vector) != vector_size:
+                self._log(
+                    f"Query embedding size {len(vector)} does not match model dimension {vector_size}; retrieval skipped",
+                    "ERROR",
+                )
+                return []
+            search_requests.append(
+                SearchRequest(
+                    vector=vector,
+                    filter=query.query_filter,
                     limit=limit,
                     score_threshold=self.valves.similarity_threshold,
-                ),
-                self._log,
-                description=f"qdrant.search[{query.label}]",
+                )
             )
-            for result in search_results:
+        memories: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        batch_results = run_qdrant_operation(
+            lambda: self.qdrant.search_batch(
+                collection_name=self.valves.collection_name,
+                requests=search_requests,
+            ),
+            self._log,
+            description="qdrant.search_batch",
+        )
+        for results in batch_results:
+            for result in results:
                 point_id = str(result.id)
                 if point_id in seen_ids:
                     continue
@@ -514,98 +687,57 @@ class Filter:
                         "score": result.score,
                     }
                 )
+        memories.sort(key=lambda memory: memory.get("score", 0.0), reverse=True)
+        memories = memories[: self.valves.top_k]
         self._log(f"Hybrid retrieval produced {len(memories)} memories", "DEBUG")
         return memories
 
-    @staticmethod
-    def _distribute_limits(total: int, buckets: int) -> list[int]:
-        if buckets <= 0:
-            return []
-        base = total // buckets
-        remainder = total % buckets
-        return [base + (1 if idx < remainder else 0) for idx in range(buckets)]
-
-    def _format_memories(self, memories: Sequence[Dict[str, Any]]) -> str:
+    def _format_memories(self, memories: Sequence[dict[str, Any]]) -> str:
         """Format episodic memories as JSON for the AI assistant's cognitive architecture."""
         if not memories:
             return "[]"
-        
+
+        user_label = self.valves.user_display_name
+        assistant_label = self.valves.ai_display_name
         json_memories = []
         for memory in memories:
             role = memory.get("role", "conversation")
             content = memory.get("content", "")
             timestamp = memory.get("timestamp", "")
-            
+
             # Determine participants based on role
             if role == "assistant":
-                participants = ["Assistant", "User"]
-                speaker = "Assistant"
+                participants = [assistant_label, user_label]
+                speaker = assistant_label
             elif role == "user":
-                participants = ["User", "Assistant"]
-                speaker = "User"
+                participants = [user_label, assistant_label]
+                speaker = user_label
             else:  # pair or conversation
-                participants = ["Assistant", "User"]
+                participants = [assistant_label, user_label]
                 speaker = "Conversation"
-            
+
             # Create structured content
             memory_content = {
                 "narrative": content,
                 "role": role,
                 "speaker": speaker,
                 "participants": participants,
-                "relevance_score": memory.get("score", 0.0)
+                "relevance_score": memory.get("score", 0.0),
             }
-            
-            json_memories.append({
-                "collection": "episodic",
-                "content": memory_content,
-                "timestamp": timestamp,
-                "existing_id": memory.get("id")
-            })
-        
+
+            json_memories.append(
+                {
+                    "collection": "episodic",
+                    "content": memory_content,
+                    "timestamp": timestamp,
+                    "existing_id": memory.get("id"),
+                }
+            )
+
         return _format_memories_json(json_memories)
 
-    def _format_timestamp(self, timestamp_str: str) -> str:
-        if not timestamp_str:
-            return "unknown time"
-        try:
-            normalized = timestamp_str.replace("Z", "+00:00")
-            parsed = datetime.fromisoformat(normalized)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=LOCAL_TIMEZONE)
-            local_timestamp = parsed.astimezone(LOCAL_TIMEZONE)
-            now_local = datetime.now(LOCAL_TIMEZONE)
-            delta = now_local - local_timestamp
-            if delta.total_seconds() < 0:
-                delta = -delta
-            if delta.days > 365:
-                years = delta.days // 365
-                relative = f"{years} year{'s' if years != 1 else ''} ago"
-            elif delta.days > 30:
-                months = delta.days // 30
-                relative = f"{months} month{'s' if months != 1 else ''} ago"
-            elif delta.days > 0:
-                relative = f"{delta.days} day{'s' if delta.days != 1 else ''} ago"
-            elif delta.seconds > 3600:
-                hours = delta.seconds // 3600
-                relative = f"{hours} hour{'s' if hours != 1 else ''} ago"
-            else:
-                minutes = max(delta.seconds // 60, 1)
-                relative = f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-            absolute = local_timestamp.strftime("%Y-%m-%d %H:%M %Z")
-            return f"{absolute} | {relative}"
-        except Exception:
-            return timestamp_str[:16].replace("T", " ") or timestamp_str
-
-    def _display_info_for_role(self, role: str) -> tuple[str, str]:
-        if role == "user":
-            return self.valves.user_display_name, "user"
-        if role == "assistant":
-            return self.valves.ai_display_name, "assistant"
-        return "CONVERSATION", "pair"
-
     @staticmethod
-    def _find_latest_assistant_message(messages: Sequence[Dict[str, Any]]) -> str:
+    def _find_latest_assistant_message(messages: Sequence[dict[str, Any]]) -> str:
         for message in reversed(messages):
             if message.get("role") == "assistant":
                 return (message.get("content") or "").strip()
