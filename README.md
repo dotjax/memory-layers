@@ -29,8 +29,8 @@ An episodic memory layer that:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/dotjax/memory-layers.git
-   cd memory-layers
+   git clone https://github.com/dotjax/openwebui-episodic-memory-filter
+   cd openwebui-episodic-memory-filter
    ```
 
 2. Install dependencies:
@@ -41,7 +41,7 @@ An episodic memory layer that:
 3. Add the filter to Open WebUI:
    - Admin Panel -> Settings -> Filters
    - "+ Add Filter"
-   - Paste `filters/episodic.py` into the editor
+   - Paste `filter/episodic.py` into the editor
    - Save and enable the filter
 
 ### Optional: Run Qdrant Server
